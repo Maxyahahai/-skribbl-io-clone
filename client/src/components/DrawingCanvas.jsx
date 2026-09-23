@@ -16,7 +16,14 @@ function DrawingCanvas({ roomCode, isDrawer }) {
     const [brushSize, setBrushSize] = useState(4);
     const [isEraser, setIsEraser] = useState(false);
 
+    // Full stroke history — needed so undo/redraw works
+    // identically for the drawer AND every remote guesser
+
+    const strokesRef = useRef([]);       // completed strokes: [{ points, color, size, isEraser }]
+    const currentStrokeRef = useRef(null); // stroke currently being drawn (local or remote)
+
     // Keep refs in sync so socket handlers (closures) always read latest values
+
     const colorRef = useRef(color);
     const brushSizeRef = useRef(brushSize);
     const isEraserRef = useRef(isEraser);
@@ -26,12 +33,14 @@ function DrawingCanvas({ roomCode, isDrawer }) {
     useEffect(() => { isEraserRef.current = isEraser; }, [isEraser]);
 
     // Get canvas context
+
     const getContext = () => {
         const canvas = canvasRef.current;
         return canvas.getContext("2d");
     };
 
     // Get mouse position
+
     const getMousePosition = (e) => {
         const canvas = canvasRef.current;
         const rect = canvas.getBoundingClientRect();
@@ -41,7 +50,8 @@ function DrawingCanvas({ roomCode, isDrawer }) {
         };
     };
 
-    // Apply current brush settings to a context (local or remote)
+    // Apply brush settings to a context before drawing a stroke
+
     const applyBrushSettings = (ctx, strokeColor, size, eraser) => {
         ctx.lineJoin = "round";
         ctx.lineCap = "round";
@@ -49,7 +59,6 @@ function DrawingCanvas({ roomCode, isDrawer }) {
 
         if (eraser) {
             ctx.globalCompositeOperation = "destination-out";
-            // color doesn't matter for destination-out, but set anyway
             ctx.strokeStyle = "rgba(0,0,0,1)";
         } else {
             ctx.globalCompositeOperation = "source-over";
@@ -58,9 +67,55 @@ function DrawingCanvas({ roomCode, isDrawer }) {
     };
 
     // =========================
+    // REDRAW EVERYTHING
+    // Wipes the canvas and replays every stored stroke
+    // in order — this is what makes undo actually work,
+    // since strokes can overlap each other
+    // =========================
+
+    const redrawAll = () => {
+
+        const canvas = canvasRef.current;
+
+        if (!canvas) return;
+
+        const ctx = canvas.getContext("2d");
+
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        strokesRef.current.forEach((stroke) => {
+
+            if (stroke.points.length === 0) return;
+
+            applyBrushSettings(ctx, stroke.color, stroke.size, stroke.isEraser);
+
+            ctx.beginPath();
+
+            ctx.moveTo(stroke.points[0].x, stroke.points[0].y);
+
+            for (let i = 1; i < stroke.points.length; i++) {
+                ctx.lineTo(stroke.points[i].x, stroke.points[i].y);
+            }
+
+            ctx.stroke();
+
+            ctx.closePath();
+
+        });
+
+        // reset composite mode so nothing bleeds into next draw
+
+        ctx.globalCompositeOperation = "source-over";
+
+    };
+
+
+    // =========================
     // START STROKE
     // =========================
+
     const startDrawing = (e) => {
+
         if (!isDrawer) return;
 
         const { x, y } = getMousePosition(e);
@@ -73,6 +128,13 @@ function DrawingCanvas({ roomCode, isDrawer }) {
 
         setIsDrawing(true);
 
+        currentStrokeRef.current = {
+            points: [{ x, y }],
+            color,
+            size: brushSize,
+            isEraser
+        };
+
         socket.emit("start_stroke", {
             roomCode,
             x,
@@ -81,12 +143,16 @@ function DrawingCanvas({ roomCode, isDrawer }) {
             size: brushSize,
             isEraser
         });
+
     };
+
 
     // =========================
     // DRAW
     // =========================
+
     const draw = (e) => {
+
         if (!isDrawer || !isDrawing) return;
 
         const { x, y } = getMousePosition(e);
@@ -95,96 +161,208 @@ function DrawingCanvas({ roomCode, isDrawer }) {
         ctx.lineTo(x, y);
         ctx.stroke();
 
+        if (currentStrokeRef.current) {
+            currentStrokeRef.current.points.push({ x, y });
+        }
+
         socket.emit("draw", {
             roomCode,
             x,
             y
         });
+
     };
+
 
     // =========================
     // END STROKE
     // =========================
+
     const stopDrawing = () => {
+
         if (!isDrawer || !isDrawing) return;
 
         setIsDrawing(false);
 
+        if (currentStrokeRef.current) {
+            strokesRef.current.push(currentStrokeRef.current);
+            currentStrokeRef.current = null;
+        }
+
         socket.emit("end_stroke", {
             roomCode
         });
+
     };
+
 
     // =========================
     // CLEAR CANVAS (drawer only)
     // =========================
+
     const clearCanvas = () => {
+
         if (!isDrawer) return;
+
+        strokesRef.current = [];
 
         const canvas = canvasRef.current;
         const ctx = getContext();
         ctx.clearRect(0, 0, canvas.width, canvas.height);
 
         socket.emit("canvas_clear", { roomCode });
+
     };
+
+
+    // =========================
+    // UNDO LAST STROKE (drawer only)
+    // =========================
+
+    const undoLastStroke = () => {
+
+        if (!isDrawer) return;
+
+        if (strokesRef.current.length === 0) return;
+
+        strokesRef.current.pop();
+
+        redrawAll();
+
+        socket.emit("draw_undo", { roomCode });
+
+    };
+
 
     // =========================
     // SOCKET LISTENERS
     // =========================
+
     useEffect(() => {
 
         const handleStartStroke = (data) => {
+
             const canvas = canvasRef.current;
+
             if (!canvas) return;
+
             const ctx = canvas.getContext("2d");
 
             applyBrushSettings(ctx, data.color, data.size, data.isEraser);
 
             ctx.beginPath();
             ctx.moveTo(data.x, data.y);
+
+            currentStrokeRef.current = {
+                points: [{ x: data.x, y: data.y }],
+                color: data.color,
+                size: data.size,
+                isEraser: data.isEraser
+            };
+
         };
 
+
         const handleRemoteDraw = (data) => {
+
             const canvas = canvasRef.current;
+
             if (!canvas) return;
+
             const ctx = canvas.getContext("2d");
 
             ctx.lineTo(data.x, data.y);
             ctx.stroke();
+
+            if (currentStrokeRef.current) {
+                currentStrokeRef.current.points.push({ x: data.x, y: data.y });
+            }
+
         };
+
 
         const handleEndStroke = () => {
+
             const canvas = canvasRef.current;
+
             if (!canvas) return;
+
             const ctx = canvas.getContext("2d");
+
             ctx.closePath();
+
+            if (currentStrokeRef.current) {
+                strokesRef.current.push(currentStrokeRef.current);
+                currentStrokeRef.current = null;
+            }
+
         };
 
+
         const handleCanvasClear = () => {
+
+            strokesRef.current = [];
+
             const canvas = canvasRef.current;
+
             if (!canvas) return;
+
             const ctx = canvas.getContext("2d");
+
             ctx.clearRect(0, 0, canvas.width, canvas.height);
+
         };
+
+
+        const handleDrawUndo = () => {
+
+            if (strokesRef.current.length === 0) return;
+
+            strokesRef.current.pop();
+
+            redrawAll();
+
+        };
+
 
         socket.on("start_stroke", handleStartStroke);
         socket.on("draw", handleRemoteDraw);
         socket.on("end_stroke", handleEndStroke);
         socket.on("canvas_clear", handleCanvasClear);
+        socket.on("draw_undo", handleDrawUndo);
+
 
         return () => {
+
             socket.off("start_stroke", handleStartStroke);
             socket.off("draw", handleRemoteDraw);
             socket.off("end_stroke", handleEndStroke);
             socket.off("canvas_clear", handleCanvasClear);
+            socket.off("draw_undo", handleDrawUndo);
+
         };
 
     }, []);
 
+
+    // Reset stroke history whenever this drawer's turn starts fresh
+    // (new round_start / choose_word means canvas should already be
+    // blank, but this keeps local history in sync just in case)
+
+    useEffect(() => {
+
+        strokesRef.current = [];
+        currentStrokeRef.current = null;
+
+    }, [roomCode, isDrawer]);
+
+
     return (
+
         <div>
 
             {isDrawer && (
+
                 <div style={{ display: "flex", gap: "10px", alignItems: "center", marginBottom: "8px" }}>
 
                     {/* Colors */}
@@ -226,10 +404,16 @@ function DrawingCanvas({ roomCode, isDrawer }) {
                         Eraser
                     </button>
 
+                    {/* Undo */}
+                    <button onClick={undoLastStroke}>
+                        Undo
+                    </button>
+
                     {/* Clear */}
                     <button onClick={clearCanvas}>Clear</button>
 
                 </div>
+
             )}
 
             <canvas
@@ -248,7 +432,9 @@ function DrawingCanvas({ roomCode, isDrawer }) {
             />
 
         </div>
+
     );
+
 }
 
 export default DrawingCanvas;

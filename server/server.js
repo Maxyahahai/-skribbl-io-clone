@@ -679,6 +679,25 @@ io.on("connection", (socket) => {
         }
     );
 
+    socket.on(
+    "draw_undo",
+    ({ roomCode }) => {
+
+        const room = rooms.get(roomCode);
+
+        if (!room) return;
+
+        if (socket.id !== room.currentDrawer) {
+            return;
+        }
+
+        socket.to(roomCode).emit(
+            "draw_undo"
+        );
+
+    }
+);
+
 
     // DISCONNECT
 
